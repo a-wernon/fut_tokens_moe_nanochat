@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from nanochat.common import get_dist_info, print0
 from nanochat.muon import Muon, DistMuon
 from nanochat.adamw import DistAdamW
+from nanochat.moe import MoEClassical
 
 @dataclass
 class GPTConfig:
@@ -31,6 +32,12 @@ class GPTConfig:
     n_head: int = 6 # number of query heads
     n_kv_head: int = 6 # number of key/value heads (GQA)
     n_embd: int = 768
+    # MoE (Mixture of Experts) configuration
+    use_moe: bool = False # whether to use MoE instead of standard MLP
+    n_expert: int = 8 # number of experts in MoE layers
+    max_expert_per_tok: int = 2 # number of experts to route each token to (top-k)
+    # Multi-token prediction configuration
+    n_predict_tokens: int = 1 # number of tokens to predict ahead (1 = standard autoregressive)
 
 
 def norm(x):
@@ -127,7 +134,10 @@ class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        if config.use_moe:
+            self.mlp = MoEClassical(config)
+        else:
+            self.mlp = MLP(config)
 
     def forward(self, x, cos_sin, kv_cache):
         x = x + self.attn(norm(x), cos_sin, kv_cache)
@@ -143,7 +153,18 @@ class GPT(nn.Module):
             "wte": nn.Embedding(config.vocab_size, config.n_embd),
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # Create multiple prediction heads for multi-token prediction
+        if config.n_predict_tokens == 1:
+            # Standard single-token prediction
+            self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+            self.lm_heads = None
+        else:
+            # Multi-token prediction: create n_predict_tokens heads
+            self.lm_head = None  # Keep for backward compatibility but don't use
+            self.lm_heads = nn.ModuleList([
+                nn.Linear(config.n_embd, config.vocab_size, bias=False)
+                for _ in range(config.n_predict_tokens)
+            ])
         # To support meta device initialization, we init the rotary embeddings here, but it's fake
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them, but assert fail if we ever reach that amount.
@@ -157,10 +178,19 @@ class GPT(nn.Module):
     def init_weights(self):
         self.apply(self._init_weights)
         # zero out classifier weights
-        torch.nn.init.zeros_(self.lm_head.weight)
+        if self.config.n_predict_tokens == 1:
+            torch.nn.init.zeros_(self.lm_head.weight)
+        else:
+            for head in self.lm_heads:
+                torch.nn.init.zeros_(head.weight)
         # zero out c_proj weights in all blocks
         for block in self.transformer.h:
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            if self.config.use_moe:
+                # For MoE, zero out c_proj weights in all experts
+                for expert in block.mlp.experts:
+                    torch.nn.init.zeros_(expert.c_proj.weight)
+            else:
+                torch.nn.init.zeros_(block.mlp.c_proj.weight)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
         # init the rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
@@ -216,7 +246,10 @@ class GPT(nn.Module):
         # Separate out all parameters into 3 groups (matrix, embedding, lm_head)
         matrix_params = list(self.transformer.h.parameters())
         embedding_params = list(self.transformer.wte.parameters())
-        lm_head_params = list(self.lm_head.parameters())
+        if self.config.n_predict_tokens == 1:
+            lm_head_params = list(self.lm_head.parameters())
+        else:
+            lm_head_params = list(self.lm_heads.parameters())
         assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params)
         # Create the AdamW optimizer for the embedding and lm_head
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (having tuned the LRs for 768 dim model)
@@ -259,21 +292,70 @@ class GPT(nn.Module):
             x = block(x, cos_sin, kv_cache)
         x = norm(x)
 
-        # Forward the lm_head (compute logits)
+        # Forward the prediction heads (compute logits)
         softcap = 15
         if targets is not None:
             # training mode: compute and return the loss
-            # TODO: experiment with Liger Kernels / chunked cross-entropy etc.
-            logits = self.lm_head(x)
-            logits = softcap * torch.tanh(logits / softcap) # logits softcap
-            logits = logits.float() # use tf32/fp32 for logits
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
-            return loss
+            if self.config.n_predict_tokens == 1:
+                # Standard single-token prediction
+                logits = self.lm_head(x)
+                logits = softcap * torch.tanh(logits / softcap) # logits softcap
+                logits = logits.float() # use tf32/fp32 for logits
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+                return loss
+            else:
+                # Multi-token prediction: compute loss for all heads
+                losses = []
+                for head_idx, head in enumerate(self.lm_heads):
+                    logits = head(x)
+                    logits = softcap * torch.tanh(logits / softcap) # logits softcap
+                    logits = logits.float() # use tf32/fp32 for logits
+                    
+                    # Create targets shifted by head_idx+1 positions
+                    # Head 0 predicts t+1, Head 1 predicts t+2, etc.
+                    if head_idx == 0:
+                        # First head: standard next-token prediction
+                        target_shifted = targets
+                    else:
+                        # Shift targets forward by head_idx positions
+                        # Pad with -1 (ignore_index) for positions that don't have targets
+                        target_shifted = torch.full_like(targets, -1)
+                        target_shifted[:, :-head_idx] = targets[:, head_idx:]
+                    
+                    # Compute loss for this head
+                    head_loss = F.cross_entropy(
+                        logits.view(-1, logits.size(-1)), 
+                        target_shifted.view(-1), 
+                        ignore_index=-1, 
+                        reduction=loss_reduction
+                    )
+                    losses.append(head_loss)
+                
+                # Average losses across all heads
+                if loss_reduction == 'mean':
+                    total_loss = sum(losses) / len(losses)
+                elif loss_reduction == 'sum':
+                    total_loss = sum(losses)
+                else:
+                    # For 'none', return a list or concatenate
+                    total_loss = torch.stack(losses) if isinstance(losses[0], torch.Tensor) else losses
+                
+                return total_loss
         else:
             # inference mode: compute and return the logits
-            logits = self.lm_head(x)
-            logits = softcap * torch.tanh(logits / softcap) # logits softcap
-            return logits
+            if self.config.n_predict_tokens == 1:
+                logits = self.lm_head(x)
+                logits = softcap * torch.tanh(logits / softcap) # logits softcap
+                return logits
+            else:
+                # Return logits for all heads as a list or stacked tensor
+                all_logits = []
+                for head in self.lm_heads:
+                    logits = head(x)
+                    logits = softcap * torch.tanh(logits / softcap) # logits softcap
+                    all_logits.append(logits)
+                # Return as tuple for easier access: (head_0_logits, head_1_logits, ...)
+                return tuple(all_logits)
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
@@ -291,7 +373,14 @@ class GPT(nn.Module):
             rng.manual_seed(seed)
         ids = torch.tensor([tokens], dtype=torch.long, device=device) # add batch dim
         for _ in range(max_tokens):
-            logits = self.forward(ids) # (B, T, vocab_size)
+            logits_output = self.forward(ids) # (B, T, vocab_size) or tuple of logits for multi-token
+            # Handle multi-token prediction: use first head for standard generation
+            if self.config.n_predict_tokens == 1:
+                logits = logits_output
+            else:
+                # For multi-token prediction, use the first head (next token prediction)
+                # TODO: implement speculative decoding for multi-token prediction
+                logits = logits_output[0]
             logits = logits[:, -1, :] # (B, vocab_size)
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
