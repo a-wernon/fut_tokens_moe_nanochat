@@ -5,6 +5,7 @@ Also a lot of borrowing of ideas from modded-nanogpt.
 import torch
 from torch import Tensor
 import torch.distributed as dist
+import warnings
 
 @torch.compile
 def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
@@ -57,9 +58,16 @@ class Muon(torch.optim.Optimizer):
         nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
         ns_steps: The number of Newton-Schulz iteration steps to use.
     """
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5):
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5, model=None):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
         params: list[Tensor] = [*params]
+        # Store model reference for better parameter name resolution in warnings
+        self._model_ref = model
+        # Build parameter-to-name mapping if model is provided
+        self._param_to_name = {}
+        if model is not None:
+            for name, param in model.named_parameters():
+                self._param_to_name[id(param)] = name
         param_groups = []
         for size in {p.numel() for p in params}:
             group = dict(params=[p for p in params if p.numel() == size])
@@ -68,11 +76,23 @@ class Muon(torch.optim.Optimizer):
 
     @torch.no_grad()
     def step(self):
+        # Track parameters with None gradients for debugging
+        params_with_none_grads = []
+        
         for group in self.param_groups:
             params: list[Tensor] = group["params"]
             for p in params:
                 g = p.grad
-                assert g is not None
+                # Handle None gradients (can happen with torch.compile optimizations or unused parameters)
+                if g is None:
+                    # Store parameter info for debugging
+                    param_id = id(p)
+                    param_name = self._param_to_name.get(param_id, f'param_{param_id}')
+                    param_shape = tuple(p.shape)
+                    params_with_none_grads.append((param_name, param_shape, p.dtype, p.device, param_id))
+                    # Initialize gradient to zero if it's None
+                    p.grad = torch.zeros_like(p)
+                    g = p.grad
                 state = self.state[p]
                 if "momentum_buffer" not in state:
                     state["momentum_buffer"] = torch.zeros_like(g)
@@ -81,6 +101,20 @@ class Muon(torch.optim.Optimizer):
                 g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
                 g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
                 p.add_(g, alpha=-group["lr"] * max(1, p.size(-2) / p.size(-1))**0.5)
+        
+        # Warn if any parameters had None gradients
+        if params_with_none_grads:
+            warning_msg = (
+                f"Muon optimizer: {len(params_with_none_grads)} parameter(s) had None gradients "
+                f"and were initialized to zero. This may indicate:\n"
+                f"  1. torch.compile graph optimizations disconnected some parameters\n"
+                f"  2. Parameters are truly unused in the forward pass\n"
+                f"  3. A bug in the model's computational graph\n\n"
+                f"Affected parameters:\n"
+            )
+            for i, (name, shape, dtype, device, param_id) in enumerate(params_with_none_grads, 1):
+                warning_msg += f"  {i}. {name} | shape={shape} | dtype={dtype} | device={device} | id={param_id}\n"
+            warnings.warn(warning_msg, UserWarning, stacklevel=2)
 
 
 class DistMuon(torch.optim.Optimizer):
@@ -105,11 +139,18 @@ class DistMuon(torch.optim.Optimizer):
         ns_steps: number of Newton–Schulz iterations for the orthogonalization
     """
     def __init__(self, params, lr: float = 0.02, momentum: float = 0.95,
-                 nesterov: bool = True, ns_steps: int = 5):
+                 nesterov: bool = True, ns_steps: int = 5, model=None):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
         params = list(params)
         assert all(p.ndim == 2 for p in params), "Muon expects 2D parameters only"
         rank = dist.get_rank()
+        # Store model reference for better parameter name resolution in warnings
+        self._model_ref = model
+        # Build parameter-to-name mapping if model is provided
+        self._param_to_name = {}
+        if model is not None:
+            for name, param in model.named_parameters():
+                self._param_to_name[id(param)] = name
         # Group all parameters by their shape
         shapes = sorted({p.shape for p in params}) # sort to ensure consistent / deterministic ordering
         param_groups = []
@@ -128,8 +169,31 @@ class DistMuon(torch.optim.Optimizer):
         rank = dist.get_rank()
         world_size = dist.get_world_size()
 
-        # Ensure all grads exist
-        assert all(p.grad is not None for group in self.param_groups for p in group["params"]), "All params must have grads"
+        # Ensure all grads exist - initialize None gradients to zero
+        # Track parameters with None gradients for debugging
+        params_with_none_grads = []
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    param_id = id(p)
+                    param_name = getattr(self, '_param_to_name', {}).get(param_id, f'param_{param_id}')
+                    param_shape = tuple(p.shape)
+                    params_with_none_grads.append((param_name, param_shape, p.dtype, p.device, param_id))
+                    p.grad = torch.zeros_like(p)
+        
+        # Warn if any parameters had None gradients
+        if params_with_none_grads:
+            warning_msg = (
+                f"DistMuon optimizer: {len(params_with_none_grads)} parameter(s) had None gradients "
+                f"and were initialized to zero. This may indicate:\n"
+                f"  1. torch.compile graph optimizations disconnected some parameters\n"
+                f"  2. Parameters are truly unused in the forward pass\n"
+                f"  3. A bug in the model's computational graph\n\n"
+                f"Affected parameters:\n"
+            )
+            for i, (name, shape, dtype, device, param_id) in enumerate(params_with_none_grads, 1):
+                warning_msg += f"  {i}. {name} | shape={shape} | dtype={dtype} | device={device} | id={param_id}\n"
+            warnings.warn(warning_msg, UserWarning, stacklevel=2)
 
         # Kick off all the reduce scatter operations to average up the gradients across all ranks
         all_reduce_futures = []
