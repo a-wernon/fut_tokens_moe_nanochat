@@ -71,7 +71,9 @@ pretrain_batch_size = meta.get("device_batch_size", None)
 if pretrain_batch_size is not None and device_batch_size > pretrain_batch_size:
     print0(f"FOOTGUN WARNING: base model training used device_batch_size {pretrain_batch_size}, did you pass in a good --device_batch_size to this script?")
 orig_model = model
-model = torch.compile(model, dynamic=False)
+# MoE layers create dynamic tensor shapes due to routing, so use dynamic=True when MoE is enabled
+compile_dynamic = model.config.use_moe if hasattr(model.config, 'use_moe') else False
+model = torch.compile(model, dynamic=compile_dynamic)
 depth = model.config.n_layer
 num_flops_per_token = model.estimate_flops()
 tokens_per_fwdbwd = device_batch_size * max_seq_len # tokens per iteration for a single rank

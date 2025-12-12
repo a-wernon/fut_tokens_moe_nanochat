@@ -19,10 +19,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Optional: Liger Kernel for memory-efficient fused linear cross-entropy loss
+try:
+    from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
+    LIGER_KERNEL_AVAILABLE = True
+except ImportError:
+    LIGER_KERNEL_AVAILABLE = False
+
 from nanochat.common import get_dist_info, print0
 from nanochat.muon import Muon, DistMuon
 from nanochat.adamw import DistAdamW
-from nanochat.moe import MoEClassical
+from nanochat.moe import MoEClassical, MoELookforward
 
 @dataclass
 class GPTConfig:
@@ -34,10 +41,16 @@ class GPTConfig:
     n_embd: int = 768
     # MoE (Mixture of Experts) configuration
     use_moe: bool = False # whether to use MoE instead of standard MLP
+    moe_type: str = "classical" # type of MoE: "classical" or "lookforward"
     n_expert: int = 8 # number of experts in MoE layers
     max_expert_per_tok: int = 2 # number of experts to route each token to (top-k)
+    moe_aux_loss_coef: float = 0.01 # coefficient for MoE load balancing auxiliary loss (0 = disabled)
+    moe_kl_loss_coef: float = 1 # coefficient for KL divergence loss in lookforward MoE (0 = disabled)
     # Multi-token prediction configuration
     n_predict_tokens: int = 1 # number of tokens to predict ahead (1 = standard autoregressive)
+    # Memory optimization
+    # TODO: enable this when liger-kernel package is ready
+    use_liger_kernel: bool = False # use Liger Kernel FLCE loss for memory efficiency (requires liger-kernel package)
 
 
 def norm(x):
@@ -134,15 +147,26 @@ class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
+        self.use_moe = config.use_moe
+        self.moe_type = getattr(config, 'moe_type', 'classical')
+        
         if config.use_moe:
-            self.mlp = MoEClassical(config)
+            if self.moe_type == 'lookforward':
+                self.mlp = MoELookforward(config)
+            else:  # classical
+                self.mlp = MoEClassical(config)
         else:
             self.mlp = MLP(config)
 
     def forward(self, x, cos_sin, kv_cache):
         x = x + self.attn(norm(x), cos_sin, kv_cache)
-        x = x + self.mlp(norm(x))
-        return x
+        if self.use_moe:
+            mlp_out, aux_loss = self.mlp(norm(x))
+            x = x + mlp_out
+            return x, aux_loss
+        else:
+            x = x + self.mlp(norm(x))
+            return x, None
 
 
 class GPT(nn.Module):
@@ -264,7 +288,8 @@ class GPT(nn.Module):
         AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=True)
         adamw_optimizer = AdamWFactory(adam_groups, **adamw_kwargs)
         # Create the Muon optimizer for the linear layers
-        muon_kwargs = dict(lr=matrix_lr, momentum=0.95)
+        # Pass model reference for better parameter name resolution in debugging
+        muon_kwargs = dict(lr=matrix_lr, momentum=0.95, model=self)
         MuonFactory = DistMuon if ddp else Muon
         muon_optimizer = MuonFactory(matrix_params, **muon_kwargs)
         # Combine them the two optimizers into one list
@@ -288,8 +313,12 @@ class GPT(nn.Module):
         # Forward the trunk of the Transformer
         x = self.transformer.wte(idx)
         x = norm(x)
+        # Accumulate MoE auxiliary losses
+        moe_aux_loss = 0.0 if self.config.use_moe else None
         for block in self.transformer.h:
-            x = block(x, cos_sin, kv_cache)
+            x, aux_loss = block(x, cos_sin, kv_cache)
+            if aux_loss is not None:
+                moe_aux_loss = moe_aux_loss + aux_loss
         x = norm(x)
 
         # Forward the prediction heads (compute logits)
@@ -302,6 +331,9 @@ class GPT(nn.Module):
                 logits = softcap * torch.tanh(logits / softcap) # logits softcap
                 logits = logits.float() # use tf32/fp32 for logits
                 loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+                # Add MoE auxiliary loss if using MoE
+                if moe_aux_loss is not None and moe_aux_loss != 0.0:
+                    loss = loss + moe_aux_loss
                 return loss
             else:
                 # Multi-token prediction: compute loss for all heads
@@ -338,7 +370,12 @@ class GPT(nn.Module):
                     total_loss = sum(losses)
                 else:
                     # For 'none', return a list or concatenate
-                    total_loss = torch.stack(losses) if isinstance(losses[0], torch.Tensor) else losses
+                    # TODO: mb implement mode for true none reduction, but now none reduction is a part of train loop, that I do not want to change
+                    total_loss = torch.stack(losses).sum(axis=0) if isinstance(losses[0], torch.Tensor) else losses
+                
+                # Add MoE auxiliary loss if using MoE
+                if moe_aux_loss is not None and moe_aux_loss != 0.0:
+                    total_loss = total_loss + moe_aux_loss
                 
                 return total_loss
         else:
