@@ -44,7 +44,7 @@ class GPTConfig:
     moe_type: str = "classical" # type of MoE: "classical" or "lookforward"
     n_expert: int = 8 # number of experts in MoE layers
     max_expert_per_tok: int = 2 # number of experts to route each token to (top-k)
-    moe_aux_loss_coef: float = 0.01 # coefficient for MoE load balancing auxiliary loss (0 = disabled)
+    alpha: float = 0.01 # coefficient for MoE load balancing auxiliary loss (0 = disabled)
     moe_kl_loss_coef: float = 1 # coefficient for KL divergence loss in lookforward MoE (0 = disabled)
     # Multi-token prediction configuration
     n_predict_tokens: int = 1 # number of tokens to predict ahead (1 = standard autoregressive)
@@ -151,19 +151,21 @@ class Block(nn.Module):
         self.moe_type = getattr(config, 'moe_type', 'classical')
         
         if config.use_moe:
+            # Use 'moe' attribute name for checkpoint compatibility with old GPTMoE
             if self.moe_type == 'lookforward':
-                self.mlp = MoELookforward(config)
+                self.moe = MoELookforward(config)
             else:  # classical
-                self.mlp = MoEClassical(config)
+                self.moe = MoEClassical(config)
         else:
             self.mlp = MLP(config)
 
     def forward(self, x, cos_sin, kv_cache):
         x = x + self.attn(norm(x), cos_sin, kv_cache)
         if self.use_moe:
-            mlp_out, aux_loss = self.mlp(norm(x))
+            mlp_out, aux_info = self.moe(norm(x))
             x = x + mlp_out
-            return x, aux_loss
+            # aux_info is router_logits for classical MoE, or aux_loss for lookforward MoE
+            return x, aux_info
         else:
             x = x + self.mlp(norm(x))
             return x, None
@@ -210,8 +212,14 @@ class GPT(nn.Module):
         # zero out c_proj weights in all blocks
         for block in self.transformer.h:
             if self.config.use_moe:
-                # For MoE, zero out c_proj weights in all experts
-                for expert in block.mlp.experts:
+                # For MoE, zero out gate and c_proj weights in all experts
+                moe_type = getattr(self.config, 'moe_type', 'classical')
+                if moe_type == 'lookforward':
+                    torch.nn.init.zeros_(block.moe.gate_prior.weight)
+                    torch.nn.init.zeros_(block.moe.gate_posterior.weight)
+                else:
+                    torch.nn.init.zeros_(block.moe.gate.weight)
+                for expert in block.moe.experts:
                     torch.nn.init.zeros_(expert.c_proj.weight)
             else:
                 torch.nn.init.zeros_(block.mlp.c_proj.weight)
@@ -299,6 +307,94 @@ class GPT(nn.Module):
                 group["initial_lr"] = group["lr"]
         return optimizers
 
+    def _compute_moe_aux_loss(self, aux_info_list, loss_reduction='mean'):
+        """
+        Compute MoE auxiliary losses from collected aux_info.
+        
+        Args:
+            aux_info_list: List of aux_info from each MoE block.
+                - For classical MoE: each is router_logits tensor
+                - For lookforward MoE: each is (router_logits, prior_logits, posterior_logits) tuple
+            loss_reduction: Loss reduction mode ('mean', 'sum', or 'none')
+        
+        Returns:
+            moe_aux_loss: Total auxiliary loss (or None if no loss)
+            scalars: Dict with individual loss components for logging (empty if loss_reduction='none')
+        """
+        moe_type = getattr(self.config, 'moe_type', 'classical')
+        scalars = {}
+        # Only compute scalar metrics when we have scalar losses
+        compute_scalars = loss_reduction in ('mean', 'sum')
+        
+        if moe_type == 'lookforward':
+            # For lookforward: aux_info is (router_logits, prior_logits, posterior_logits)
+            # Separate into lists
+            all_router_logits = []
+            all_prior_logits = []
+            all_posterior_logits = []
+            
+            for aux_info in aux_info_list:
+                if isinstance(aux_info, tuple) and len(aux_info) == 3:
+                    router_logits, prior_logits, posterior_logits = aux_info
+                    all_router_logits.append(router_logits)
+                    all_prior_logits.append(prior_logits)
+                    all_posterior_logits.append(posterior_logits)
+                else:
+                    # Inference mode: just router_logits
+                    all_router_logits.append(aux_info)
+            
+            moe_aux_loss = 0.0
+            
+            # 1. Load balancing loss
+            if self.config.alpha > 0 and all_router_logits:
+                lb_loss = load_balancing_loss_func(
+                    tuple(all_router_logits),
+                    self.config.n_expert,
+                    self.config.max_expert_per_tok
+                )
+                scaled_lb_loss = self.config.alpha * lb_loss
+                moe_aux_loss = moe_aux_loss + scaled_lb_loss
+                if compute_scalars:
+                    scalars['load_balancing_loss'] = lb_loss.detach().item() if isinstance(lb_loss, torch.Tensor) else lb_loss
+            
+            # 2. KL divergence loss: KL(posterior || prior)
+            moe_kl_loss_coef = getattr(self.config, 'moe_kl_loss_coef', 1.0)
+            if moe_kl_loss_coef > 0 and all_posterior_logits:
+                # Concatenate all logits from all layers
+                prior_logits_cat = torch.cat(all_prior_logits, dim=0)
+                posterior_logits_cat = torch.cat(all_posterior_logits, dim=0)
+                
+                # Compute KL(posterior || prior)
+                prior_log_probs = F.log_softmax(prior_logits_cat, dim=-1)
+                posterior_log_probs = F.log_softmax(posterior_logits_cat, dim=-1)
+                posterior_probs = F.softmax(posterior_logits_cat, dim=-1)
+                
+                kl_div = (posterior_probs * (posterior_log_probs - prior_log_probs)).sum(dim=-1)
+                kl_loss = kl_div.mean() * moe_kl_loss_coef
+                moe_aux_loss = moe_aux_loss + kl_loss
+                if compute_scalars:
+                    scalars['kl_loss'] = kl_loss.detach().item()
+            
+            if moe_aux_loss == 0.0:
+                return None, scalars
+            
+            if compute_scalars:
+                scalars['moe_aux_loss'] = moe_aux_loss.detach().item() if isinstance(moe_aux_loss, torch.Tensor) else moe_aux_loss
+            return moe_aux_loss, scalars
+        else:
+            # For classical: aux_info_list contains router_logits
+            # Compute load balancing loss across all layers
+            lb_loss = load_balancing_loss_func(
+                tuple(aux_info_list), 
+                self.config.n_expert, 
+                self.config.max_expert_per_tok
+            )
+            moe_aux_loss = self.config.alpha * lb_loss
+            if compute_scalars:
+                scalars['load_balancing_loss'] = lb_loss.detach().item() if isinstance(lb_loss, torch.Tensor) else lb_loss
+                scalars['moe_aux_loss'] = moe_aux_loss.detach().item() if isinstance(moe_aux_loss, torch.Tensor) else moe_aux_loss
+            return moe_aux_loss, scalars
+
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
         B, T = idx.size()
 
@@ -313,12 +409,14 @@ class GPT(nn.Module):
         # Forward the trunk of the Transformer
         x = self.transformer.wte(idx)
         x = norm(x)
-        # Accumulate MoE auxiliary losses
-        moe_aux_loss = 0.0 if self.config.use_moe else None
+        # Collect aux_info from MoE blocks:
+        # - For classical MoE: router_logits (tensors)
+        # - For lookforward MoE: (router_logits, prior_logits, posterior_logits) tuples
+        aux_info_list = [] if self.config.use_moe else None
         for block in self.transformer.h:
-            x, aux_loss = block(x, cos_sin, kv_cache)
-            if aux_loss is not None:
-                moe_aux_loss = moe_aux_loss + aux_loss
+            x, aux_info = block(x, cos_sin, kv_cache)
+            if aux_info is not None:
+                aux_info_list.append(aux_info)
         x = norm(x)
 
         # Forward the prediction heads (compute logits)
@@ -330,11 +428,22 @@ class GPT(nn.Module):
                 logits = self.lm_head(x)
                 logits = softcap * torch.tanh(logits / softcap) # logits softcap
                 logits = logits.float() # use tf32/fp32 for logits
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
-                # Add MoE auxiliary loss if using MoE
-                if moe_aux_loss is not None and moe_aux_loss != 0.0:
-                    loss = loss + moe_aux_loss
-                return loss
+                main_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+                
+                # Compute MoE auxiliary loss
+                if self.config.use_moe and aux_info_list:
+                    moe_aux_loss, scalars = self._compute_moe_aux_loss(aux_info_list, loss_reduction)
+                    
+                    if moe_aux_loss is not None:
+                        loss = main_loss + moe_aux_loss
+                        # Only add scalar metrics when loss is actually a scalar
+                        if loss_reduction in ('mean', 'sum'):
+                            scalars['main_loss'] = main_loss.detach().item()
+                        return loss, scalars
+                    else:
+                        return main_loss, {}
+                else:
+                    return main_loss, {}
             else:
                 # Multi-token prediction: compute loss for all heads
                 losses = []
@@ -365,19 +474,28 @@ class GPT(nn.Module):
                 
                 # Average losses across all heads
                 if loss_reduction == 'mean':
-                    total_loss = sum(losses) / len(losses)
+                    main_loss = sum(losses) / len(losses)
                 elif loss_reduction == 'sum':
-                    total_loss = sum(losses)
+                    main_loss = sum(losses)
                 else:
                     # For 'none', return a list or concatenate
                     # TODO: mb implement mode for true none reduction, but now none reduction is a part of train loop, that I do not want to change
-                    total_loss = torch.stack(losses).sum(axis=0) if isinstance(losses[0], torch.Tensor) else losses
+                    main_loss = torch.stack(losses).sum(axis=0) if isinstance(losses[0], torch.Tensor) else losses
                 
-                # Add MoE auxiliary loss if using MoE
-                if moe_aux_loss is not None and moe_aux_loss != 0.0:
-                    total_loss = total_loss + moe_aux_loss
-                
-                return total_loss
+                # Compute MoE auxiliary loss
+                if self.config.use_moe and aux_info_list:
+                    moe_aux_loss, scalars = self._compute_moe_aux_loss(aux_info_list, loss_reduction)
+                    
+                    if moe_aux_loss is not None:
+                        loss = main_loss + moe_aux_loss
+                        # Only add scalar metrics when loss is actually a scalar
+                        if loss_reduction in ('mean', 'sum'):
+                            scalars['main_loss'] = main_loss.detach().item() if isinstance(main_loss, torch.Tensor) else main_loss
+                        return loss, scalars
+                    else:
+                        return main_loss, {}
+                else:
+                    return main_loss, {}
         else:
             # inference mode: compute and return the logits
             if self.config.n_predict_tokens == 1:
@@ -431,3 +549,86 @@ class GPT(nn.Module):
             ids = torch.cat((ids, next_ids), dim=1)
             token = next_ids.item()
             yield token
+
+
+# Copied from transformers.models.mixtral.modeling_mixtral.load_balancing_loss_func
+def load_balancing_loss_func(
+    gate_logits,
+    num_experts,
+    top_k=2,
+    attention_mask=None,
+):
+    """
+    Computes auxiliary load balancing loss as in Switch Transformer - implemented in Pytorch.
+
+    See Switch Transformer (https://huggingface.co/papers/2101.03961) for more details. This function implements the loss
+    function presented in equations (4) - (6) of the paper. It aims at penalizing cases where the routing between
+    experts is too unbalanced.
+
+    Args:
+        gate_logits:
+            Logits from the `gate`, should be a tuple of model.config.num_hidden_layers tensors of
+            shape [batch_size X sequence_length, num_experts].
+        num_experts:
+            Number of experts
+        top_k:
+            The number of experts to route per-token, can be also interpreted as the `top-k` routing
+            parameter.
+        attention_mask (`torch.Tensor`, *optional*):
+            The attention_mask used in forward function
+            shape [batch_size X sequence_length] if not None.
+
+    Returns:
+        The auxiliary loss.
+    """
+    if gate_logits is None or not isinstance(gate_logits, tuple):
+        return 0
+
+    if isinstance(gate_logits, tuple):
+        compute_device = gate_logits[0].device
+        concatenated_gate_logits = torch.cat([layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0)
+
+    routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
+
+    _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+
+    expert_mask = torch.nn.functional.one_hot(selected_experts, num_experts)
+
+    if attention_mask is None:
+        # Compute the percentage of tokens routed to each experts
+        tokens_per_expert = torch.mean(expert_mask.float(), dim=0)
+
+        # Compute the average probability of routing to these experts
+        router_prob_per_expert = torch.mean(routing_weights, dim=0)
+    else:
+        batch_size, sequence_length = attention_mask.shape
+        num_hidden_layers = concatenated_gate_logits.shape[0] // (batch_size * sequence_length)
+
+        # Compute the mask that masks all padding tokens as 0 with the same shape of expert_mask
+        expert_attention_mask = (
+            attention_mask[None, :, :, None, None]
+            .expand((num_hidden_layers, batch_size, sequence_length, top_k, num_experts))
+            .reshape(-1, top_k, num_experts)
+            .to(compute_device)
+        )
+
+        # Compute the percentage of tokens routed to each experts
+        tokens_per_expert = torch.sum(expert_mask.float() * expert_attention_mask, dim=0) / torch.sum(
+            expert_attention_mask, dim=0
+        )
+
+        # Compute the mask that masks all padding tokens as 0 with the same shape of tokens_per_expert
+        router_per_expert_attention_mask = (
+            attention_mask[None, :, :, None]
+            .expand((num_hidden_layers, batch_size, sequence_length, num_experts))
+            .reshape(-1, num_experts)
+            .to(compute_device)
+        )
+
+        # Compute the average probability of routing to these experts
+        router_prob_per_expert = torch.sum(routing_weights * router_per_expert_attention_mask, dim=0) / torch.sum(
+            router_per_expert_attention_mask, dim=0
+        )
+
+    overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
+    return overall_loss * num_experts

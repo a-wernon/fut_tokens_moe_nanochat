@@ -17,6 +17,7 @@ dependencies = [
     "uvicorn>=0.36.0",
     "wandb>=0.21.3",
     "liger-kernel>=0.1.0; platform_system != 'Darwin'",  # Optional: memory-efficient kernels (CUDA/ROCm only)
+    "tensorboard[gpu]>=2.20.0",
 ]
 
 [build-system]

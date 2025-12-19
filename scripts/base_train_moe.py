@@ -21,7 +21,7 @@ from collections import defaultdict
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
-from nanochat.gpt import GPT, GPTConfig
+from nanochat.gpt_moe import GPTMoE, GPTMoEConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader, tokenizing_distributed_data_loader_with_state
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -39,12 +39,15 @@ device_type = "" # cuda|cpu|mps (empty => autodetect good device type default, i
 # Model architecture
 depth = 12 # the depth of the Transformer model to train, rest of the kwargs are derived
 max_seq_len = 1024 # max context length
+num_experts = 8
+max_experts_per_token = 2
+alpha = 0.01
 # Training horizon. Only one of these 3 will be used, in this order of precedence.
 num_iterations = -1 # explicit number of steps of the optimization (-1 = disable)
 target_flops = -1.0 # calculate num_iterations to reach target_flops. Useful for scaling laws experiments (-1 = disable)
 target_param_data_ratio = 20 # calculate num_iterations to maintain fixed data:param ratio (Chinchilla=20) (-1 = disable)
 # Optimization
-device_batch_size = 128 # per-device batch size (set to not OOM)
+device_batch_size = 64 # per-device batch size (set to not OOM)
 total_batch_size = 524288 # total desired batch size, in #tokens
 embedding_lr = 0.2 # learning rate for the embedding parameters (Adam)
 unembedding_lr = 0.004 # learning rate for the unembedding parameters (Adam)
@@ -55,9 +58,6 @@ warmup_ratio = 0.0 # ratio of iterations for LR warmup
 warmdown_ratio = 0.2 # ratio of iterations for LR warmdown
 final_lr_frac = 0.0 # final LR is this fraction of the initial LR
 resume_from_step = -1 # resume training from this step of the optimization (-1 = disable)
-use_moe = False # whether to use MoE instead of standard MLP
-moe_type = "classical" # type of MoE: "classical" or "lookforward" (only used if use_moe=True)
-n_predict_tokens = 1 # number of tokens to predict ahead (1 = standard autoregressive)
 # Evaluation
 eval_every = 250 # every how many steps to evaluate the model for val bpb
 eval_tokens = 20*524288 # number of tokens to evaluate val loss on
@@ -66,7 +66,7 @@ core_metric_max_per_task = 500 # examples per task in estimating the core metric
 sample_every = 2000 # every how many steps to sample from the model
 save_every = -1 # every how many steps to save model checkpoints (-1 = disable, and save only at the end of the run)
 # Output
-model_tag = "" # optionally override the model tag for the output checkpoint directory name
+model_tag = f"d{depth}_moe" # optionally override the model tag for the output checkpoint directory name
 # now allow CLI to override the settings via the configurator lol
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open(os.path.join('nanochat', 'configurator.py')).read()) # overrides from command line or config file
@@ -115,17 +115,17 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 # Initialize the Model
 
 # Create a new model with random weights
-model_config_kwargs = dict(sequence_len=max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim, use_moe=use_moe, moe_type=moe_type, n_predict_tokens=n_predict_tokens)
+model_config_kwargs = dict(sequence_len=max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim,
+                           n_expert=num_experts, max_expert_per_tok=max_experts_per_token, alpha=alpha)
 with torch.device("meta"):
-    model_config = GPTConfig(**model_config_kwargs)
-    model = GPT(model_config)
+    model_config = GPTMoEConfig(**model_config_kwargs)
+    model = GPTMoE(model_config)
 model.to_empty(device=device)
 model.init_weights()
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
-output_dirname = model_tag if model_tag else f"d{depth}" # e.g. d12
-checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
+checkpoint_dir = os.path.join(base_dir, "base_checkpoints", model_tag)
 resuming = resume_from_step != -1
 if resuming:
     print0(f"Resuming optimization from step {resume_from_step}")
@@ -134,9 +134,7 @@ if resuming:
     del model_data # free up this memory after the copy
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-# MoE layers create dynamic tensor shapes due to routing, so use dynamic=True when MoE is enabled
-compile_dynamic = use_moe  # dynamic=True for MoE, dynamic=False otherwise
-model = torch.compile(model, dynamic=compile_dynamic)
+model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 num_params = sum(p.numel() for p in model.parameters())
 print0(f"Number of parameters: {num_params:,}")
 num_flops_per_token = model.estimate_flops()
@@ -202,7 +200,7 @@ def get_muon_momentum(it):
     return momentum
 
 # tensorboard
-tb_logger = SummaryWriter(log_dir=os.path.join(base_dir, "tb_logs", "base", output_dirname))
+tb_logger = SummaryWriter(log_dir=os.path.join(base_dir, "tb_logs", "base", model_tag))
 
 # -----------------------------------------------------------------------------
 # Loop state (variables updated by the training loop)
@@ -219,7 +217,7 @@ else:
     val_bpb = meta_data["val_bpb"]
     min_val_bpb = loop_state["min_val_bpb"]
     smooth_train_loss = loop_state["smooth_train_loss"]
-    smooth_train_scalars = defaultdict(lambda: 0, loop_state.get("smooth_train_scalars", {}))
+    smooth_train_scalars = loop_state["smooth_train_scalars"]
     total_training_time = loop_state["total_training_time"]
 
 # -----------------------------------------------------------------------------
@@ -305,7 +303,7 @@ while True:
                 "loop_state": { # all loop state (other than step) so that we can resume training
                     "min_val_bpb": min_val_bpb,
                     "smooth_train_loss": smooth_train_loss,
-                    "smooth_train_scalars": dict(smooth_train_scalars),
+                    "smooth_train_scalars": smooth_train_scalars,
                     "total_training_time": total_training_time,
                 },
             },

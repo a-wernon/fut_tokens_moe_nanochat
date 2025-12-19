@@ -72,7 +72,19 @@ def build_model(checkpoint_dir, step, device, phase):
         }
     # Hack: fix torch compile issue, which prepends all keys with _orig_mod.
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
-    model_config_kwargs = meta_data["model_config"]
+    model_config_kwargs = meta_data["model_config"].copy()
+    
+    # Handle old GPTMoEConfig checkpoints (have n_expert but no use_moe)
+    if "n_expert" in model_config_kwargs and "use_moe" not in model_config_kwargs:
+        log0("Detected old GPTMoEConfig checkpoint, adding compatibility fields")
+        model_config_kwargs["use_moe"] = True
+        model_config_kwargs["moe_type"] = "classical"
+        # Add defaults for missing fields
+        model_config_kwargs.setdefault("alpha", 0.01)
+        model_config_kwargs.setdefault("moe_kl_loss_coef", 1.0)
+        model_config_kwargs.setdefault("n_predict_tokens", 1)
+        model_config_kwargs.setdefault("use_liger_kernel", False)
+    
     log0(f"Building model with config: {model_config_kwargs}")
     model_config = GPTConfig(**model_config_kwargs)
     with torch.device("meta"):

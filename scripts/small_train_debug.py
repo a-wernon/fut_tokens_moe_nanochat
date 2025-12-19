@@ -15,9 +15,11 @@ import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import time
 from contextlib import nullcontext
+from collections import defaultdict
 
-import wandb
+# import wandb
 import torch
+from torch.utils.tensorboard import SummaryWriter
 
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader, tokenizing_distributed_data_loader_with_state
@@ -31,7 +33,7 @@ print_banner()
 
 # -----------------------------------------------------------------------------
 # User settings
-run = "dummy" # wandb run name default ("dummy" is special - we won't log to wandb)
+# run = "dummy" # wandb run name default ("dummy" is special - we won't log to wandb)
 # Runtime
 device_type = "" # cuda|cpu|mps (empty => autodetect good device type default, in order: CUDA > MPS > CPU)
 # Model architecture
@@ -80,8 +82,8 @@ synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
 
 # wandb logging init
-use_dummy_wandb = run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=run, config=user_config)
+# use_dummy_wandb = run == "dummy" or not master_process
+# wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=run, config=user_config)
 
 # Tokenizer will be useful for evaluation, also we need the vocab size
 tokenizer = get_tokenizer()
@@ -199,6 +201,9 @@ def get_muon_momentum(it):
     momentum = (1 - frac) * 0.85 + frac * 0.95
     return momentum
 
+# tensorboard
+tb_logger = SummaryWriter(log_dir=os.path.join(base_dir, "tb_logs", "base", output_dirname))
+
 # -----------------------------------------------------------------------------
 # Loop state (variables updated by the training loop)
 
@@ -206,12 +211,15 @@ if not resuming:
     step = 0
     min_val_bpb = float("inf")
     smooth_train_loss = 0 # EMA of training loss
+    smooth_train_scalars = defaultdict(lambda: 0)
     total_training_time = 0 # total wall-clock time of training
 else:
     step = meta_data["step"]
     loop_state = meta_data["loop_state"]
+    val_bpb = meta_data["val_bpb"]
     min_val_bpb = loop_state["min_val_bpb"]
     smooth_train_loss = loop_state["smooth_train_loss"]
+    smooth_train_scalars = defaultdict(lambda: 0, loop_state.get("smooth_train_scalars", {}))
     total_training_time = loop_state["total_training_time"]
 
 # -----------------------------------------------------------------------------
@@ -230,12 +238,13 @@ while True:
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
-        wandb_run.log({
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "total_training_time": total_training_time,
-            "val/bpb": val_bpb,
-        })
+        # wandb_run.log({
+        #     "step": step,
+        #     "total_training_flops": flops_so_far,
+        #     "total_training_time": total_training_time,
+        #     "val/bpb": val_bpb,
+        # })
+        tb_logger.add_scalar("val/bpb", val_bpb, step)
         model.train()
 
     # once in a while: estimate the CORE metric (all ranks participate)
@@ -246,12 +255,15 @@ while True:
         with autocast_ctx:
             results = evaluate_model(orig_model, tokenizer, device, max_per_task=core_metric_max_per_task)
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
-        wandb_run.log({
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "core_metric": results["core_metric"],
-            "centered_results": results["centered_results"],
-        })
+        # wandb_run.log({
+        #     "step": step,
+        #     "total_training_flops": flops_so_far,
+        #     "core_metric": results["core_metric"],
+        #     "centered_results": results["centered_results"],
+        # })
+        tb_logger.add_scalar("core_metric", results["core_metric"], step)
+        for k, v in results["centered_results"].items():
+            tb_logger.add_scalar(f"centered_results/{k}", v, step)
         model.train()
 
     # once in a while: sample from the model (only on master process)
@@ -293,6 +305,7 @@ while True:
                 "loop_state": { # all loop state (other than step) so that we can resume training
                     "min_val_bpb": min_val_bpb,
                     "smooth_train_loss": smooth_train_loss,
+                    "smooth_train_scalars": dict(smooth_train_scalars),
                     "total_training_time": total_training_time,
                 },
             },
@@ -310,7 +323,7 @@ while True:
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss = model(x, y)
+            loss, scalars = model(x, y)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
@@ -340,6 +353,9 @@ while True:
     ema_beta = 0.9 # EMA decay factor for some smoothing just for nicer logging
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss.item() # EMA the training loss
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
+    for k, v in scalars.items():
+        smooth_train_scalars[k] = ema_beta * smooth_train_scalars[k] + (1 - ema_beta) * v
+    debiased_smooth_scalars = {k: v / (1 - ema_beta**(step + 1)) for k, v in smooth_train_scalars.items()}
     pct_done = 100 * step / num_iterations
     tok_per_sec = int(total_batch_size / dt)
     flops_per_sec = num_flops_per_token * total_batch_size / dt
@@ -355,6 +371,7 @@ while True:
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "train/loss": debiased_smooth_loss,
+            **{f"train/{k}": v for k, v in debiased_smooth_scalars.items()},
             "train/lrm": lrm,
             "train/dt": dt,
             "train/tok_per_sec": tok_per_sec,
@@ -362,7 +379,9 @@ while True:
         }
         if grad_clip_enabled:
             log_data["train/grad_norm"] = grad_norm
-        wandb_run.log(log_data)
+        # wandb_run.log(log_data)
+        for k, v in log_data.items():
+            tb_logger.add_scalar(k, v, step)
 
     # state update
     step += 1
@@ -399,5 +418,5 @@ get_report().log(section="Base model training", data=[
 ])
 
 # cleanup
-wandb_run.finish() # wandb run finish
+# wandb_run.finish() # wandb run finish
 compute_cleanup()
